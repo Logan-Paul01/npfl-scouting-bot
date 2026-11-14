@@ -1,0 +1,30 @@
+# NPFL Pre-Match Scouting Bot — Phase 1 dependencies
+# Everything here is free / open source. No paid SDKs.
+
+# --- HTTP + parsing ---
+requests>=2.31,<3
+beautifulsoup4>=4.12,<5
+lxml>=5.1
+
+# --- Google Sheets (database) + Drive (manual mirror) ---
+gspread>=6.0,<7
+google-auth>=2.28,<3
+google-api-python-client>=2.120,<3
+
+# --- AI brain ---
+# Groq is called over its OpenAI-compatible HTTP API with `requests` (already
+# pinned above), so no extra SDK is required.
+
+# --- Video intelligence (Method A: transcripts only, never video files) ---
+youtube-transcript-api>=1.2,<2
+
+# --- Tactical visuals (Phase 3) ---
+mplsoccer>=1.4,<2
+matplotlib>=3.8,<4
+pandas>=2.1,<3
+
+# --- Telegram interface (Phase 2) ---
+python-telegram-bot>=21.6,<23
+
+# --- Local config ---
+python-dotenv>=1.0,<2
