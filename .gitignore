@@ -1,0 +1,36 @@
+# --- Secrets & credentials (never commit) ---
+.env
+.env.*
+!.env.example
+credentials.json
+service-account*.json
+token.json
+client_secret*.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Temporary rendered artifacts (pitch maps are generated at runtime) ---
+*.png
+*.jpg
+*.jpeg
+!docs/**/*.png
+
+# --- Local HTTP cache + scraped payloads ---
+.cache/
+data/cache/
+*.log
+
+# --- OS / editor noise ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
