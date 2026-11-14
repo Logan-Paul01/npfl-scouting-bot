@@ -57,7 +57,7 @@ Hardware assumption: any machine that can run Python 3.11+ and `pip install -r r
 |---|---|---|
 | Interface | **Telegram Bot** — `python-telegram-bot` | Free Bot API. Implemented in `bot.py` (Phase 2). |
 | Database / storage | **SQLite** — `scouting.db` via stdlib `sqlite3` | One file in the repo root. `db.py` is the only module allowed to touch the database. |
-| AI brain | **Groq** `qwen/qwen3.8-27b` (default, override with `GROQ_MODEL`) | **Tool-calling mandatory.** The LLM must query Python functions that read the database. It never guesses or hallucinates statistics. |
+| AI brain | **Groq** `qwen/qwen3.8-27b` (default, override with `GROQ_MODEL`) | **Tool-calling mandatory.** The LLM must query Python functions that read the database. It never guesses or hallucinates statistics. On the Groq free plan (30 RPM, 1,000 RPD, 8,000 TPM, 200,000 TPD). |
 | Tactical visuals | `mplsoccer` + `matplotlib` | Dark mode: background `#121826`. Pitch maps, shot maps, passing networks. Phase 3. |
 | Video intelligence (Method A) | `youtube-transcript-api` → Groq → timestamp links | Store `https://youtu.be/{video_id}?t={seconds}`. No video files. |
 | Data ingestion | **Sofascore** (primary), **Flashscore / FootyStats** (fallback) | Fixtures, form, lineups, incidents, shot coordinates. |
@@ -95,6 +95,7 @@ Derived fields are honest about their window: `form` and `clean_sheets` are comp
 ## 4. Security & GitHub Rules
 
 - **Never hardcode** API keys, tokens, chat IDs or any credential. Load everything from environment variables: `.env` locally (via `python-dotenv`), **GitHub Secrets** in CI.
+- Secret names are matched **case- and punctuation-insensitively** by `bot.py::_secret`, so `TELEGRAM_BOT_TOKEN`, `Telegram_Bot_Token` and `telegram-bot-token` all work. A secret stored in any of those spellings is usable without renaming.
 - Never commit: `.env`, `__pycache__/`, `.venv/`, temporary `.png` outputs, `.cache/`, and the generated `scouting.db` (with its `-journal`/`-wal`/`-shm` sidecars).
 - `.gitignore` is created and maintained first; if a secret is ever committed, rotate the key rather than rewriting history silently.
 - The database is a local SQLite file (`scouting.db`): nothing is sent to a third party, so there are no database credentials or service accounts to manage.
@@ -114,7 +115,7 @@ Derived fields are honest about their window: `form` and `clean_sheets` are comp
 | `SOFASCORE_NPFL_TOURNAMENT_ID` | optional | Override auto-discovery of the NPFL tournament id |
 | `FOOTYSTATS_API_KEY` | optional Secret | Enables the FootyStats fallback |
 | `NPFL_CACHE_TTL` | optional | HTTP cache TTL in seconds (default 1800) |
-| `TELEGRAM_BOT_TOKEN` | `.env` + Secret | Bot token from @BotFather (secret-store spellings such as `Telegram_Bot_Token` are normalised) |
+| `TELEGRAM_BOT_TOKEN` | `.env` + Secret | Bot token from @BotFather (any spelling; see above) |
 | `TELEGRAM_ALLOWED_USER_IDS` | `.env` + Secret | Comma-separated Telegram user ids allowed to use the bot |
 | `TELEGRAM_ALLOW_ALL` | optional, local only | `1` bypasses the allowlist — never set in production |
 | `NPFL_BOT_CACHE_TTL` | optional | Seconds to cache database reads inside the bot (default 60) |
@@ -129,12 +130,12 @@ The whole dataset lives in one file, `scouting.db`, in the repository root:
 - Created automatically by `db.ensure_schema()` on the first write, with the tables from §3.1.
 - Writes are idempotent upserts keyed on stable IDs, so re-running an ingest updates rows instead of duplicating them.
 - `NPFL_DB_PATH` points the stack at a different file (tests, scratch copies).
-- The database and its `-journal`/`-wal`/`-shm` sidecars are gitignored: it is generated data, not source.
+- The database and its `-journal`/`-wal`/`-shm` sidecars are gitignored: it is generated data, not source. A SQLite file committed to git would churn on every ingest and conflict on every pull, and the copy in the workspace holds demo rows, not real league data.
 - Inspect it with any SQLite client: `sqlite3 scouting.db ".tables"` or `sqlite3 scouting.db "select * from matches limit 5"`.
 
 ### 5.1 Persistence on GitHub Actions
 
-A workflow run starts from a clean checkout, so a database built on the runner is **not** carried into the next run. The daily workflow uploads `scouting.db` as a 7-day artifact so each run is inspectable, but durable history needs one of: running the ingest where the file lives, committing the database deliberately, or adding a cache/restore step. Until one of those is chosen, the local copy is the source of truth.
+A workflow run starts from a clean checkout, so the database built on a previous run is not in the working tree. Both jobs therefore restore and save it through the **Actions cache** (`actions/cache@v4`, key `scouting-db-<run_id>` with `restore-keys: scouting-db-`), which is why the `video` job can see `video_queue` rows and `matches` written by the `fixtures` job and by earlier days. Each run also uploads `scouting.db` as a 7-day artifact so a single run is inspectable. The cache is a convenience, not a backup: if entries are evicted the next run simply starts from an empty database, and the owner's local copy remains the reference.
 
 ---
 
@@ -203,7 +204,7 @@ Update this checklist at the end of **every** task. `[x]` means implemented **an
 - [x] `ingest_youtube.py` — URL → transcript (with description-chapters and goal-minute fallbacks)
 - [x] `ingest_youtube.py` — Groq tool-calling extraction of structured tactical events
 - [x] `ingest_youtube.py` — `video_clips` upsert with `&t={seconds}` links, dedupe, `video_queue` mode
-- [x] `.github/workflows/daily_ingest.yml` — daily cron + manual dispatch + `scouting.db` artifact
+- [x] `.github/workflows/daily_ingest.yml` — daily cron + manual dispatch + `scouting.db` artifact + Actions-cache restore/save of the database in both jobs
 
 ### Phase 2 — Telegram bot
 - [x] `bot.py` — `python-telegram-bot` entrypoint, allowlist enforced (default deny)
@@ -211,7 +212,8 @@ Update this checklist at the end of **every** task. `[x]` means implemented **an
 - [x] `/preview <home> vs <away>` dossier: form, goal-timing, head-to-head, clip links + facts-only coach brief
 - [x] Hard refusal path when a stat is absent (deterministic commands render "no stored data" instead of a number)
 - [x] `/form`, `/match`, `/clips`, `/teams`, `/id`, `/refresh` plus free-text `/ask` with per-user cooldown
-- [x] Handler-level end-to-end run against the local store: real ingest → `/teams`, `/preview`, `/form`, `/match`, `/clips` (Telegram transport validated separately by `getMe` + polling startup)
+- [x] Handler-level end-to-end run against the local store: real ingest → `/teams`, `/preview`, `/form`, `/match`, `/clips`
+- [x] Live polling verified against the real bot (`--check` → `getMe` ok for @Tactixlbot, polling started, clean shutdown); secret-name spellings normalised by `_secret`
 - [ ] Deploy: run on a free-tier host or the owner's laptop; no paid infra (needs the owner's machine or a free host — not built yet)
 
 ### Phase 3 — Tactical visuals (not started)
