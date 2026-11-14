@@ -24,6 +24,9 @@ env/
 *.jpeg
 !docs/**/*.png
 
+# --- Local build / hand-off artifacts ---
+artifacts/
+
 # --- Local HTTP cache + scraped payloads ---
 .cache/
 data/cache/

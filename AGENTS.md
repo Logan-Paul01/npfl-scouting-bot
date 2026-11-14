@@ -83,6 +83,13 @@ Derived fields are honest about their window: `form` and `clean_sheets` are comp
 3. Tool outputs are the only permitted source; the model's own football knowledge may only be used for *interpretation* wording, clearly framed as analysis, never as data.
 4. Every video claim must carry a timestamp link produced by `ingest_youtube.py`.
 
+### 3.3 Known source constraints
+
+- **Sofascore blocks datacentre IPs.** `api.sofascore.com` returns `403` from cloud/GitHub-Actions-style addresses; the mobile host `api.sofascore.app` is the probe target when the primary host refuses. This is a source limitation, not a bug: the adapter chain must degrade to FootyStats/Flashscore and the run must report which source actually served data.
+- **Flashscore is JS-rendered.** Its results page often contains no parseable match rows; the adapter raises a clear `SourceError` instead of guessing.
+- **TheSportsDB** works keyless from datacentres with real NPFL data (league `4827`), but its free key is truncated: ~5 table rows, 1 recent event, and quick `429`s. It proves the pipeline and gives partial results/table; it cannot carry production scouting.
+- Consequence: ingestion is verified on a normal residential IP or via a fallback source, never assumed from a cloud run.
+
 ---
 
 ## 4. Security & GitHub Rules
@@ -93,6 +100,7 @@ Derived fields are honest about their window: `form` and `clean_sheets` are comp
 - Google Sheets access uses a **service account** shared on the single spreadsheet (`GOOGLE_SHEET_ID`), not a personal OAuth login.
 - Least privilege: the service account only needs edit access to that one Sheet and (optionally) one Drive folder.
 - Logs must never print secrets or full credential JSON. Log lengths/prefixes only if a debug fingerprint is needed.
+- `bot.py` installs a logging filter that redacts `TELEGRAM_BOT_TOKEN` and silences `httpx` request logging (httpx prints full URLs, which contain the token). A token that ever reaches a log is treated as compromised and rotated in @BotFather.
 - Secrets are only ever read in the workflow `env:` block from `secrets.*`.
 - CI must never write to `main` or push commits; it only writes to Google Sheets.
 
@@ -114,6 +122,8 @@ Derived fields are honest about their window: `form` and `clean_sheets` are comp
 | `TELEGRAM_ALLOW_ALL` | optional, local only | `1` bypasses the allowlist — never set in production |
 | `NPFL_BOT_CACHE_TTL` | optional | Seconds to cache Sheet reads inside the bot (default 60) |
 | `NPFL_LLM_COOLDOWN` | optional | Per-user seconds between LLM calls (default 8) |
+| `NPFL_STORAGE` | optional | `sheets` (default, production) or `local` (credential-free JSON store for testing) |
+| `NPFL_LOCAL_STORE` | optional | Path for the local store (default `.cache/npfl_local_store.json`, gitignored) |
 
 ---
 
@@ -125,6 +135,19 @@ Derived fields are honest about their window: `form` and `clean_sheets` are comp
 - Finds an existing `AGENTS.md` by name (optionally scoped to `DRIVE_FOLDER_ID`) and **updates** it, otherwise creates it.
 - Called at the end of the daily workflow as an **optional** step: if no credentials are present it logs a skip and exits `0`, so it can never break ingestion.
 - Only this manual is synced. No data, no media, no credentials.
+
+### 5.1 Local test store (temporary, credential-free)
+
+Until the Google service account exists, the full stack can be exercised against a JSON file that mimics the subset of gspread calls we use:
+
+```bash
+python scrape_npfl.py --demo --write --local     # seed .cache/npfl_local_store.json from bundled payloads
+python scrape_npfl.py --local                    # real ingest into the local store
+python bot.py --check --local                    # validate config against the local store
+NPFL_STORAGE=local python bot.py                 # run the bot on local data
+```
+
+`sheets.py` owns this switch (`NPFL_STORAGE=local`); it is a **testing** backend only, never the production path, and the store file is gitignored. It exists so bot behaviour and parsing can be validated before any Google credentials are issued.
 
 ---
 
@@ -183,6 +206,7 @@ Update this checklist at the end of **every** task. `[x]` means implemented **an
 - [x] `.gitignore` blocking `.env`, `credentials.json`, `__pycache__/`, temp `.png`, `.cache/`, `.venv/`
 - [x] `requirements.txt`
 - [x] `sheets.py` — tab schemas, service-account auth, idempotent upsert, read helpers
+- [x] `sheets.py` — local JSON backend (`NPFL_STORAGE=local`) for credential-free end-to-end tests
 
 ### Phase 1 — Data & video ingestion
 - [x] `scrape_npfl.py` — Sofascore fixtures/results, standings, form, lineups, incidents, shot coordinates
@@ -201,6 +225,7 @@ Update this checklist at the end of **every** task. `[x]` means implemented **an
 - [x] `/preview <home> vs <away>` dossier: form, goal-timing, head-to-head, clip links + facts-only coach brief
 - [x] Hard refusal path when a stat is absent (deterministic commands render "no stored data" instead of a number)
 - [x] `/form`, `/match`, `/clips`, `/teams`, `/id`, `/refresh` plus free-text `/ask` with per-user cooldown
+- [x] Handler-level end-to-end run against the local store: real ingest → `/teams`, `/preview`, `/form`, `/match`, `/clips` (Telegram transport validated separately by `getMe` + polling startup)
 - [ ] Deploy: run on a free-tier host or the owner's laptop; no paid infra (needs the owner's machine or a free host — not built yet)
 
 ### Phase 3 — Tactical visuals (not started)
