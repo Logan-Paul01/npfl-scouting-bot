@@ -43,7 +43,7 @@ Rules for every future task:
 2. **No raw 90-minute video pipelines.** Never download full match videos. Video intelligence comes from public transcripts and description chapters only (Method A).
 3. **No paid APIs, no paid tiers, no trials that expire.** Free tiers only, and the system must degrade gracefully when a free quota runs out.
 4. **Everything runs on GitHub Actions (free minutes for public repos) or the owner's laptop.** Scripts must be short-lived batch jobs, not daemons. No paid hosting, no always-on server, no managed database.
-5. **Storage stays in the free tier.** Google Sheets is the database; Google Drive only holds a copy of this manual. No media files in the repo.
+5. **Storage stays in the free tier.** SQLite (`scouting.db`) is the database — one file, no server, no cloud account, no console setup. No media files in the repo.
 6. **Request discipline.** Cache HTTP responses on disk, cap per-run request counts, respect `429`/`Retry-After`, and never run unbounded loops against a source.
 7. **Data honesty over completeness.** If a stat is not available for free, the field stays blank. Never estimate, interpolate or invent a number to fill a column.
 
@@ -56,21 +56,21 @@ Hardware assumption: any machine that can run Python 3.11+ and `pip install -r r
 | Layer | Choice | Notes |
 |---|---|---|
 | Interface | **Telegram Bot** — `python-telegram-bot` | Free Bot API. Implemented in `bot.py` (Phase 2). |
-| Database / storage | **Google Sheets** via `gspread` | Tabs act as tables. `sheets.py` is the only module allowed to touch Sheets. |
-| AI brain | **Groq** `llama-3.3-70b-versatile` | **Tool-calling mandatory.** The LLM must query Python functions that read the Sheet. It never guesses or hallucinates statistics. |
+| Database / storage | **SQLite** — `scouting.db` via stdlib `sqlite3` | One file in the repo root. `db.py` is the only module allowed to touch the database. |
+| AI brain | **Groq** `llama-3.3-70b-versatile` | **Tool-calling mandatory.** The LLM must query Python functions that read the database. It never guesses or hallucinates statistics. |
 | Tactical visuals | `mplsoccer` + `matplotlib` | Dark mode: background `#121826`. Pitch maps, shot maps, passing networks. Phase 3. |
 | Video intelligence (Method A) | `youtube-transcript-api` → Groq → timestamp links | Store `https://youtu.be/{video_id}?t={seconds}`. No video files. |
 | Data ingestion | **Sofascore** (primary), **Flashscore / FootyStats** (fallback) | Fixtures, form, lineups, incidents, shot coordinates. |
 | Scheduling | **GitHub Actions** (`.github/workflows/daily_ingest.yml`) | Morning ingest, secrets injected from repo settings. |
 
-### 3.1 Sheet schema (source of truth: `sheets.py::TAB_SCHEMAS`)
+### 3.1 Database schema (source of truth: `db.py::SCHEMAS`)
 
-- `NPFL_Matches` — fixtures, results, kickoff (UTC + Lagos), venue, status, source URL. Key: `match_id`.
-- `NPFL_Team_Stats` — standings + derived form, goals, and sampled xG/possession/shots. Key: `season` + `team_id`.
-- `NPFL_Lineups` — starters/subs, shirt numbers, formation, average positions (`avg_x`, `avg_y` on a 0–100 pitch). Key: `match_id` + `team_id` + `player_id`.
-- `NPFL_Events` — goals, cards, substitutions with minute and (when exposed) shot coordinates `x`,`y`. Key: `match_id` + `event_key`.
-- `Video_Tactical_Clips` — one row per tactical clip with `clip_url` and `timestamp_seconds`. Key: `clip_id`.
-- `Video_Queue` — YouTube URLs awaiting processing. Key: `video_url`.
+- `matches` — fixtures, results, kickoff (UTC + Lagos), venue, status, source URL. Primary key: `match_id`.
+- `team_stats` — standings + derived form, goals, and sampled xG/possession/shots. Primary key: `season` + `team_id`.
+- `lineups` — starters/subs, shirt numbers, formation, average positions (`avg_x`, `avg_y` on a 0–100 pitch). Primary key: `match_id` + `team_id` + `player_id`.
+- `events` — goals, cards, substitutions with minute and (when exposed) shot coordinates `x`,`y`. Primary key: `match_id` + `event_key`.
+- `video_clips` — one row per tactical clip with `clip_url` and `timestamp_seconds`. Primary key: `clip_id`.
+- `video_queue` — YouTube URLs awaiting processing. Primary key: `video_url`.
 
 Every row carries `source` and a `*_at`/`updated_at` UTC timestamp so the Architect can audit provenance.
 
@@ -94,74 +94,61 @@ Derived fields are honest about their window: `form` and `clean_sheets` are comp
 
 ## 4. Security & GitHub Rules
 
-- **Never hardcode** API keys, tokens, sheet IDs, service-account emails or any credential. Load everything from environment variables: `.env` locally (via `python-dotenv`), **GitHub Secrets** in CI.
-- Never commit: `.env`, `credentials.json`, service-account JSON, `token.json`, `__pycache__/`, `.venv/`, temporary `.png` outputs, `.cache/`.
+- **Never hardcode** API keys, tokens, chat IDs or any credential. Load everything from environment variables: `.env` locally (via `python-dotenv`), **GitHub Secrets** in CI.
+- Never commit: `.env`, `__pycache__/`, `.venv/`, temporary `.png` outputs, `.cache/`, and the generated `scouting.db` (with its `-journal`/`-wal`/`-shm` sidecars).
 - `.gitignore` is created and maintained first; if a secret is ever committed, rotate the key rather than rewriting history silently.
-- Google Sheets access uses a **service account** shared on the single spreadsheet (`GOOGLE_SHEET_ID`), not a personal OAuth login.
-- Least privilege: the service account only needs edit access to that one Sheet and (optionally) one Drive folder.
+- The database is a local SQLite file (`scouting.db`): nothing is sent to a third party, so there are no database credentials or service accounts to manage.
+- The database holds only public football data — never put secrets or personal data in it.
 - Logs must never print secrets or full credential JSON. Log lengths/prefixes only if a debug fingerprint is needed.
 - `bot.py` installs a logging filter that redacts `TELEGRAM_BOT_TOKEN` and silences `httpx` request logging (httpx prints full URLs, which contain the token). A token that ever reaches a log is treated as compromised and rotated in @BotFather.
 - Secrets are only ever read in the workflow `env:` block from `secrets.*`.
-- CI must never write to `main` or push commits; it only writes to Google Sheets.
+- CI must never write to `main` or push commits; it only writes the SQLite file on the runner.
 
 ### Required environment variables / secrets
 
 | Name | Where | Purpose |
 |---|---|---|
-| `GOOGLE_SHEET_ID` | `.env` + Secret | Spreadsheet that acts as the DB |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | Secret (JSON string) | Service-account credentials (CI) |
-| `GOOGLE_SERVICE_ACCOUNT_FILE` | `.env` (default `credentials.json`) | Local credentials file |
+| `NPFL_DB_PATH` | optional | SQLite file to use (default `scouting.db` in the repo root) |
 | `GROQ_API_KEY` | `.env` + Secret | LLM calls |
 | `GROQ_MODEL` | optional | Defaults to `llama-3.3-70b-versatile` |
 | `SOFASCORE_NPFL_TOURNAMENT_ID` | optional | Override auto-discovery of the NPFL tournament id |
 | `FOOTYSTATS_API_KEY` | optional Secret | Enables the FootyStats fallback |
-| `DRIVE_FOLDER_ID` | optional Secret | Target folder for the `AGENTS.md` mirror |
 | `NPFL_CACHE_TTL` | optional | HTTP cache TTL in seconds (default 1800) |
 | `TELEGRAM_BOT_TOKEN` | `.env` + Secret | Bot token from @BotFather (secret-store spellings such as `Telegram_Bot_Token` are normalised) |
 | `TELEGRAM_ALLOWED_USER_IDS` | `.env` + Secret | Comma-separated Telegram user ids allowed to use the bot |
 | `TELEGRAM_ALLOW_ALL` | optional, local only | `1` bypasses the allowlist — never set in production |
-| `NPFL_BOT_CACHE_TTL` | optional | Seconds to cache Sheet reads inside the bot (default 60) |
+| `NPFL_BOT_CACHE_TTL` | optional | Seconds to cache database reads inside the bot (default 60) |
 | `NPFL_LLM_COOLDOWN` | optional | Per-user seconds between LLM calls (default 8) |
-| `NPFL_STORAGE` | optional | `sheets` (default, production) or `local` (credential-free JSON store for testing) |
-| `NPFL_LOCAL_STORE` | optional | Path for the local store (default `.cache/npfl_local_store.json`, gitignored) |
 
 ---
 
-## 5. Google Drive Manual Sync
+## 5. SQLite Database
 
-`drive_sync.py` mirrors this file to Drive whenever credentials exist:
+The whole dataset lives in one file, `scouting.db`, in the repository root:
 
-- Uses `google-api-python-client` (`drive` v3) with the same service account.
-- Finds an existing `AGENTS.md` by name (optionally scoped to `DRIVE_FOLDER_ID`) and **updates** it, otherwise creates it.
-- Called at the end of the daily workflow as an **optional** step: if no credentials are present it logs a skip and exits `0`, so it can never break ingestion.
-- Only this manual is synced. No data, no media, no credentials.
+- Created automatically by `db.ensure_schema()` on the first write, with the tables from §3.1.
+- Writes are idempotent upserts keyed on stable IDs, so re-running an ingest updates rows instead of duplicating them.
+- `NPFL_DB_PATH` points the stack at a different file (tests, scratch copies).
+- The database and its `-journal`/`-wal`/`-shm` sidecars are gitignored: it is generated data, not source.
+- Inspect it with any SQLite client: `sqlite3 scouting.db ".tables"` or `sqlite3 scouting.db "select * from matches limit 5"`.
 
-### 5.1 Local test store (temporary, credential-free)
+### 5.1 Persistence on GitHub Actions
 
-Until the Google service account exists, the full stack can be exercised against a JSON file that mimics the subset of gspread calls we use:
-
-```bash
-python scrape_npfl.py --demo --write --local     # seed .cache/npfl_local_store.json from bundled payloads
-python scrape_npfl.py --local                    # real ingest into the local store
-python bot.py --check --local                    # validate config against the local store
-NPFL_STORAGE=local python bot.py                 # run the bot on local data
-```
-
-`sheets.py` owns this switch (`NPFL_STORAGE=local`); it is a **testing** backend only, never the production path, and the store file is gitignored. It exists so bot behaviour and parsing can be validated before any Google credentials are issued.
+A workflow run starts from a clean checkout, so a database built on the runner is **not** carried into the next run. The daily workflow uploads `scouting.db` as a 7-day artifact so each run is inspectable, but durable history needs one of: running the ingest where the file lives, committing the database deliberately, or adding a cache/restore step. Until one of those is chosen, the local copy is the source of truth.
 
 ---
 
 ## 6. Repository Layout
 
 ```
-AGENTS.md                       # this manual (auto-read each session, mirrored to Drive)
+AGENTS.md                       # this manual (auto-read each session)
 .gitignore                      # blocks secrets, caches, temp images
 requirements.txt                # pinned-ish dependency set
-sheets.py                       # only module that touches Google Sheets (schemas + upsert)
-scrape_npfl.py                  # Phase 1: Sofascore -> (FootyStats/Flashscore fallback) -> Sheets
+db.py                           # only module that touches the database (schemas + upsert)
+scouting.db                     # generated SQLite database (gitignored)
+scrape_npfl.py                  # Phase 1: Sofascore -> (FootyStats/Flashscore fallback) -> SQLite
 ingest_youtube.py               # Phase 1: transcript -> Groq -> timestamped tactical clips
-drive_sync.py                   # Optional: mirror AGENTS.md to Google Drive
-bot.py                          # Phase 2: Telegram commands + Groq tool-calling over the Sheet
+bot.py                          # Phase 2: Telegram commands + Groq tool-calling over the database
 .github/workflows/daily_ingest.yml   # Morning scheduled ingestion
 ```
 
@@ -172,13 +159,12 @@ Phase 3 (not built yet): `pitch_maps.py` (mplsoccer dark-mode visuals).
 ```bash
 python scrape_npfl.py --demo                  # offline parser smoke test, no network, no writes
 python scrape_npfl.py --dry-run               # fetch + normalise, print rows, do not write
-python scrape_npfl.py                         # full ingest into Google Sheets
+python scrape_npfl.py                         # full ingest into scouting.db
 python ingest_youtube.py --url <YT_URL> --match-id <ID> [--dry-run]
 python ingest_youtube.py --add <YT_URL> --match-id <ID>
-python ingest_youtube.py --queue              # process every pending row of Video_Queue
-python drive_sync.py --file AGENTS.md [--folder-id <ID>]
+python ingest_youtube.py --queue              # process every pending row of video_queue
 
-python bot.py --check        # validate token / Sheet / Groq config, then exit
+python bot.py --check        # validate token / database / Groq config, then exit
 python bot.py                # start Telegram polling
 ```
 
@@ -186,12 +172,12 @@ python bot.py                # start Telegram polling
 
 | Command | Behaviour |
 |---|---|
-| `/preview <team> vs <team>` / `/preview <match_id>` | Deterministic dossier from the Sheet (fixture, both team snapshots, goal-timing windows, head-to-head, clips) plus a Groq "coach brief" that may only restate those facts. |
+| `/preview <team> vs <team>` / `/preview <match_id>` | Deterministic dossier from the database (fixture, both team snapshots, goal-timing windows, head-to-head, clips) plus a Groq "coach brief" that may only restate those facts. |
 | `/form <team>` | Table row, form string, recent results. |
 | `/match <match_id>` | Fixture dossier + incident timeline. |
 | `/clips <match_id>` | Timestamped YouTube clips with exact-second links. |
 | `/teams`, `/id`, `/refresh`, `/start`, `/help` | Utility commands. |
-| Free text / `/ask` | Groq tool-calling loop with `search_matches`, `get_match`, `get_team_stats`, `get_match_events`, `get_lineups`, `get_clips`. Facts come only from tool results in the same turn. |
+| Free text / `/ask` | Groq tool-calling loop with `search_matches`, `get_match`, `get_team_stats`, `get_match_events`, `get_lineups`, `get_clips`. Facts come only from tool results in the same turn, read from `scouting.db`. |
 
 Access control: default **deny** unless the Telegram user id is in `TELEGRAM_ALLOWED_USER_IDS` (or `TELEGRAM_ALLOW_ALL=1` for local testing). The bot tells unknown users their id so the admin can add it. Deterministic commands never call the LLM; free text is rate-limited per user.
 
@@ -205,19 +191,19 @@ Update this checklist at the end of **every** task. `[x]` means implemented **an
 - [x] `AGENTS.md` project manual (purpose, budget, stack, security, checklist)
 - [x] `.gitignore` blocking `.env`, `credentials.json`, `__pycache__/`, temp `.png`, `.cache/`, `.venv/`
 - [x] `requirements.txt`
-- [x] `sheets.py` — tab schemas, service-account auth, idempotent upsert, read helpers
-- [x] `sheets.py` — local JSON backend (`NPFL_STORAGE=local`) for credential-free end-to-end tests
+- [x] `db.py` — SQLite schemas, idempotent upsert, read helpers (stdlib `sqlite3`, no credentials)
+- [x] `db.py` — `scouting.db` in the repository root, `NPFL_DB_PATH` override
+- [x] Storage migrated from Google Sheets/Drive to local SQLite; the Google Cloud console setup is dropped for the MVP
 
 ### Phase 1 — Data & video ingestion
 - [x] `scrape_npfl.py` — Sofascore fixtures/results, standings, form, lineups, incidents, shot coordinates
 - [x] `scrape_npfl.py` — FootyStats + Flashscore fallback adapters (basic fixtures, gracefully degrading)
-- [x] `scrape_npfl.py` — upsert into `NPFL_Matches` / `NPFL_Team_Stats` / `NPFL_Lineups` / `NPFL_Events`
+- [x] `scrape_npfl.py` — upsert into `matches` / `team_stats` / `lineups` / `events`
 - [x] `scrape_npfl.py` — `--demo` offline parser test, `--dry-run`, request cache and retry/backoff
 - [x] `ingest_youtube.py` — URL → transcript (with description-chapters and goal-minute fallbacks)
 - [x] `ingest_youtube.py` — Groq tool-calling extraction of structured tactical events
-- [x] `ingest_youtube.py` — `Video_Tactical_Clips` upsert with `&t={seconds}` links, dedupe, queue mode
-- [x] `.github/workflows/daily_ingest.yml` — daily cron + manual dispatch + optional Drive mirror
-- [x] `drive_sync.py` — optional `AGENTS.md` → Google Drive mirror
+- [x] `ingest_youtube.py` — `video_clips` upsert with `&t={seconds}` links, dedupe, `video_queue` mode
+- [x] `.github/workflows/daily_ingest.yml` — daily cron + manual dispatch + `scouting.db` artifact
 
 ### Phase 2 — Telegram bot
 - [x] `bot.py` — `python-telegram-bot` entrypoint, allowlist enforced (default deny)
@@ -230,20 +216,20 @@ Update this checklist at the end of **every** task. `[x]` means implemented **an
 
 ### Phase 3 — Tactical visuals (not started)
 - [ ] `pitch_maps.py` — dark-mode mplsoccer shot map (`#121826`)
-- [ ] `pitch_maps.py` — average-position map from `NPFL_Lineups.avg_x/avg_y`
+- [ ] `pitch_maps.py` — average-position map from `lineups.avg_x/avg_y`
 - [ ] `pitch_maps.py` — passing network from exposed passing data (skip cleanly if absent)
 - [ ] Bot sends generated PNGs, then deletes temp files (files stay out of the repo)
 
 ### Backlog / ideas (not approved yet)
-- [ ] Per-team scouting notes generated weekly and stored in a `Scouting_Notes` tab
+- [ ] Per-team scouting notes generated weekly and stored in a `scouting_notes` table
 - [ ] National-team filter for NPFL-based call-ups
-- [ ] Coverage audit tab: which matches lack lineups/shot coordinates (data-quality gate)
+- [ ] Coverage audit table: which matches lack lineups/shot coordinates (data-quality gate)
 
 ---
 
 ## 8. Working Agreements
 
 - Small, reviewable commits with messages that say *why*.
-- New data source? Add it as an adapter behind the existing normalisers; never let a fallback change the Sheet schema.
+- New data source? Add it as an adapter behind the existing normalisers; never let a fallback change the database schema.
 - Never widen scope silently. If something is out of budget or out of the pre-match scope, say so and stop.
 - Keep this manual current: update sections 3.1, 6 and 7 whenever schemas, files or milestones change.
