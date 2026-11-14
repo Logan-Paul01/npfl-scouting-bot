@@ -4,7 +4,7 @@ $0 rules enforced here:
   * No video download, no frame processing. Text only.
   * `youtube-transcript-api` on a public transcript; if absent we fall back to
     description chapters, then to goal minutes already stored in NPFL_Events.
-  * Groq tool-calling grounds the model in our Sheet. The model never invents stats.
+  * Groq tool-calling grounds the model in our SQLite database. The model never invents stats.
   * Clip links point at the exact second: https://youtu.be/{video_id}?t={seconds}
 
 Usage:
@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
-import sheets
+import db
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
@@ -184,9 +184,9 @@ def chapters_from_description(description: str) -> list[dict]:
 def goal_minute_segments(match_id: str) -> list[dict]:
     """Last resort: build segments from the match's stored incidents."""
     try:
-        events = sheets.find_records("NPFL_Events", match_id=match_id)
-    except Exception as exc:  # credentials / network: fall through
-        raise TranscriptUnavailable(f"could not read NPFL_Events: {exc}") from exc
+        events = db.find_records("events", match_id=match_id)
+    except Exception as exc:  # database unavailable: fall through
+        raise TranscriptUnavailable(f"could not read events table: {exc}") from exc
 
     snippets = []
     for event in events:
@@ -220,7 +220,7 @@ def load_evidence(video_id: str, match_id: str, languages: tuple[str, ...]) -> t
     except TranscriptUnavailable as exc:
         log(f"no description chapters ({exc})")
 
-    log("falling back to stored goal/card minutes from NPFL_Events")
+    log("falling back to stored goal/card minutes from the events table")
     return goal_minute_segments(match_id), "goal_minutes"
 
 
@@ -254,7 +254,7 @@ Hard rules:
 - If evidence is thin, lower confidence below 0.4 or omit the event entirely.
 - tactical_note is a concrete coaching observation (max 220 characters): what happened, why it matters, what to exploit.
 - Allow event types: {", ".join(EVENT_TYPES)}.
-- Match context comes from your tools (our Google Sheet). Use them when the transcript refers to a team, score or form you need to disambiguate.
+- Match context comes from your tools (our SQLite database). Use them when the transcript refers to a team, score or form you need to disambiguate.
 - Reply with JSON only, no prose, no markdown fences.
 
 JSON schema:
@@ -268,7 +268,7 @@ TOOLS = [
             "description": "Fetch the stored fixture row (teams, score, venue, kickoff) for a match id.",
             "parameters": {
                 "type": "object",
-                "properties": {"match_id": {"type": "string", "description": "NPFL_Matches match_id"}},
+                "properties": {"match_id": {"type": "string", "description": "matches.match_id"}},
                 "required": ["match_id"],
             },
         },
@@ -301,18 +301,18 @@ TOOLS = [
 
 
 def run_tool(name: str, arguments: dict) -> dict:
-    """Execute a grounding tool locally against Google Sheets."""
+    """Execute a grounding tool locally against the SQLite database."""
     try:
         if name == "get_match_context":
-            rows = sheets.find_records("NPFL_Matches", match_id=str(arguments.get("match_id", "")))
+            rows = db.find_records("matches", match_id=str(arguments.get("match_id", "")))
             return {"match": rows[0] if rows else None}
         if name == "get_match_events":
-            rows = sheets.find_records("NPFL_Events", match_id=str(arguments.get("match_id", "")))
+            rows = db.find_records("events", match_id=str(arguments.get("match_id", "")))
             keep = ("minute_label", "event_type", "detail", "team", "player", "home_score", "away_score")
             return {"events": [{k: row.get(k, "") for k in keep} for row in rows]}
         if name == "get_team_form":
             team = str(arguments.get("team", "")).strip().lower()
-            rows = [r for r in sheets.read_records("NPFL_Team_Stats")
+            rows = [r for r in db.read_records("team_stats")
                     if team and team in (r.get("team") or "").lower()]
             return {"teams": rows[:3]}
     except Exception as exc:  # never let a tool failure break extraction
@@ -571,19 +571,15 @@ def process_video(
         log("dry-run: nothing written")
         return {"video_id": video_id, "clips": rows, "planned_chunks": len(chunks), "dry_run": True}
 
-    spreadsheet = sheets.open_spreadsheet()
-    tabs = sheets.ensure_all_tabs(spreadsheet)
-    stats = sheets.upsert_rows(tabs["Video_Tactical_Clips"], rows, tab="Video_Tactical_Clips")
-    log(f"Video_Tactical_Clips: created={stats['created']} updated={stats['updated']}")
+    stats = db.upsert_rows("video_clips", rows)
+    log(f"video_clips: created={stats['created']} updated={stats['updated']}")
     return {"video_id": video_id, "clips": rows, "planned_chunks": len(chunks), "dry_run": False,
             "sheet_stats": stats}
 
 
 def enqueue(url: str, match_id: str) -> dict:
-    """Add a URL to Video_Queue so the daily workflow picks it up."""
+    """Add a URL to video_queue so the daily workflow picks it up."""
     video_id = video_id_from_url(url)
-    spreadsheet = sheets.open_spreadsheet()
-    tabs = sheets.ensure_all_tabs(spreadsheet)
     row = {
         "video_url": url.strip(),
         "match_id": match_id,
@@ -593,14 +589,14 @@ def enqueue(url: str, match_id: str) -> dict:
         "video_id": video_id,
         "notes": "",
     }
-    stats = sheets.upsert_rows(tabs["Video_Queue"], [row], tab="Video_Queue")
+    stats = db.upsert_rows("video_queue", [row])
     log(f"queued {video_id} for match {match_id}: {stats}")
     return row
 
 
 def process_queue(*, dry_run: bool = False, max_chunks: int = 12) -> int:
     pending = [
-        row for row in sheets.read_records("Video_Queue")
+        row for row in db.read_records("video_queue")
         if (row.get("status") or "").strip().lower() in ("", "pending", "queued", "new", "retry")
     ]
     if not pending:
@@ -608,8 +604,6 @@ def process_queue(*, dry_run: bool = False, max_chunks: int = 12) -> int:
         return 0
 
     log(f"processing {len(pending)} queued video(s)")
-    spreadsheet = None if dry_run else sheets.open_spreadsheet()
-    tabs = None if dry_run else sheets.ensure_all_tabs(spreadsheet)
 
     failures = 0
     for row in pending:
@@ -624,31 +618,25 @@ def process_queue(*, dry_run: bool = False, max_chunks: int = 12) -> int:
             log(f"failed {url}: {exc}")
 
         if not dry_run:
-            sheets.upsert_rows(
-                tabs["Video_Queue"],
+            db.upsert_rows(
+                "video_queue",
                 [{**row, "status": status, "processed_at": utc_now(), "notes": notes}],
-                tab="Video_Queue",
             )
     return failures
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Extract tactical clips from public YouTube transcripts into Google Sheets.")
+    parser = argparse.ArgumentParser(description="Extract tactical clips from public YouTube transcripts into scouting.db.")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--url", help="YouTube URL to analyse now")
     group.add_argument("--add", help="YouTube URL to queue for the daily workflow")
-    group.add_argument("--queue", action="store_true", help="process every pending Video_Queue row")
-    parser.add_argument("--match-id", default="", help="match_id from NPFL_Matches")
+    group.add_argument("--queue", action="store_true", help="process every pending video_queue row")
+    parser.add_argument("--match-id", default="", help="match_id from matches")
     parser.add_argument("--dry-run", action="store_true", help="analyse and print, never write")
     parser.add_argument("--max-chunks", type=int, default=12, help="cap chunks per video (free-tier safety, default 12)")
     parser.add_argument("--preroll", type=int, default=DEFAULT_PREROLL, help="seconds before the evidence to start the clip")
     parser.add_argument("--languages", default=",".join(LANGUAGES), help="comma-separated transcript languages")
-    parser.add_argument("--local", action="store_true", help="use the local JSON store instead of Google Sheets")
     args = parser.parse_args(argv)
-
-    if args.local:
-        os.environ["NPFL_STORAGE"] = "local"
-        log(f"local store: {sheets.local_store_path()}")
 
     if args.url or args.add:
         if not args.match_id:
