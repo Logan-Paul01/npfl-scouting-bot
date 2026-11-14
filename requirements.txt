@@ -6,10 +6,8 @@ requests>=2.31,<3
 beautifulsoup4>=4.12,<5
 lxml>=5.1
 
-# --- Google Sheets (database) + Drive (manual mirror) ---
-gspread>=6.0,<7
-google-auth>=2.28,<3
-google-api-python-client>=2.120,<3
+# --- Database ---
+# SQLite, via Python's built-in `sqlite3` module. No driver, no server, no cloud.
 
 # --- AI brain ---
 # Groq is called over its OpenAI-compatible HTTP API with `requests` (already
