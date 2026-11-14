@@ -1,4 +1,4 @@
-"""NPFL pre-match data ingestion: Sofascore (primary) -> FootyStats/Flashscore fallback -> Google Sheets.
+"""NPFL pre-match data ingestion: Sofascore (primary) -> FootyStats/Flashscore fallback -> SQLite (`scouting.db`).
 
 $0 constraints honoured here:
   * HTTP only, no browser automation, no video, no ML.
@@ -8,7 +8,7 @@ $0 constraints honoured here:
 Usage:
     python scrape_npfl.py --demo                 # offline parser smoke test (no network, no writes)
     python scrape_npfl.py --dry-run              # fetch + normalise, print a summary, no writes
-    python scrape_npfl.py                        # full ingest into Google Sheets
+    python scrape_npfl.py                        # full ingest into scouting.db
     python scrape_npfl.py --detail-limit 8 --last-limit 30
 """
 
@@ -27,7 +27,7 @@ from urllib.parse import quote
 
 import requests
 
-import sheets
+import db
 
 LAGOS = timezone(timedelta(hours=1))
 SOFASCORE_BASE = os.environ.get("SOFASCORE_BASE", "https://api.sofascore.com/api/v1")
@@ -250,7 +250,7 @@ def normalize_match(event: dict, *, season: str, source: str, now: str | None = 
 
 def normalize_incidents(match_id: str, payload: dict, *, source: str = "sofascore",
                         shotmap: dict | None = None, now: str | None = None) -> list[dict]:
-    """Goals, cards and substitutions -> NPFL_Events rows (with shot coords when exposed)."""
+    """Goals, cards and substitutions -> events rows (with shot coords when exposed)."""
     now = now or utc_now()
     incidents = (payload or {}).get("incidents") or []
 
@@ -947,7 +947,7 @@ DEMO = {
 # --- Main -----------------------------------------------------------------------
 
 def collect(args: argparse.Namespace) -> dict[str, list[dict]]:
-    """Fetch and normalise everything; returns tab -> rows (no writes)."""
+    """Fetch and normalise everything; returns table -> rows (no writes)."""
     now = utc_now()
 
     if args.demo:
@@ -983,10 +983,10 @@ def collect(args: argparse.Namespace) -> dict[str, list[dict]]:
                for event in events_payload]
 
     rows: dict[str, list[dict]] = {
-        "NPFL_Matches": matches,
-        "NPFL_Team_Stats": [],
-        "NPFL_Lineups": [],
-        "NPFL_Events": [],
+        "matches": matches,
+        "team_stats": [],
+        "lineups": [],
+        "events": [],
     }
 
     deep: dict[str, dict] = {}
@@ -994,10 +994,10 @@ def collect(args: argparse.Namespace) -> dict[str, list[dict]]:
         detail = detail_for.get(match["match_id"])
         if not detail:
             continue
-        rows["NPFL_Lineups"].extend(
+        rows["lineups"].extend(
             normalize_lineups(match["match_id"], detail.get("lineups") or {}, source=source_name, now=now)
         )
-        rows["NPFL_Events"].extend(
+        rows["events"].extend(
             normalize_incidents(
                 match["match_id"],
                 detail.get("incidents") or {},
@@ -1009,7 +1009,7 @@ def collect(args: argparse.Namespace) -> dict[str, list[dict]]:
         if match.get("status") == "finished":
             accumulate_deep(deep, match, detail)
 
-    rows["NPFL_Team_Stats"] = build_team_stats(
+    rows["team_stats"] = build_team_stats(
         season=season,
         standings_rows=standings_rows,
         matches=matches,
@@ -1020,23 +1020,20 @@ def collect(args: argparse.Namespace) -> dict[str, list[dict]]:
     return rows
 
 
-def write_to_sheets(rows: dict[str, list[dict]]) -> dict[str, dict[str, int]]:
-    spreadsheet = sheets.open_spreadsheet()
-    backend = sheets.storage_backend()
-    target = getattr(spreadsheet, "path", "Google Sheets")
-    log(f"storage backend: {backend} -> {target}")
-    tabs = sheets.ensure_all_tabs(spreadsheet)
+def write_to_db(rows: dict[str, list[dict]]) -> dict[str, dict[str, int]]:
+    target = db.ensure_schema()
+    log(f"storage backend: sqlite -> {target}")
     summary: dict[str, dict[str, int]] = {}
-    for tab, records in rows.items():
+    for table, records in rows.items():
         if not records:
-            summary[tab] = {"created": 0, "updated": 0, "skipped": 0}
+            summary[table] = {"created": 0, "updated": 0, "skipped": 0}
             continue
-        summary[tab] = sheets.upsert_rows(tabs[tab], records, tab=tab)
+        summary[table] = db.upsert_rows(table, records)
     return summary
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Ingest NPFL fixtures, form, lineups and events into Google Sheets.")
+    parser = argparse.ArgumentParser(description="Ingest NPFL fixtures, form, lineups and events into a local SQLite database.")
     parser.add_argument("--tournament-id", type=int, default=None, help="Sofascore unique-tournament id override")
     parser.add_argument("--season-id", type=int, default=None, help="Sofascore season id override")
     parser.add_argument("--next-limit", type=int, default=20, help="upcoming fixtures to ingest (default 20)")
@@ -1046,13 +1043,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="normalise and print, never write")
     parser.add_argument("--demo", action="store_true", help="offline parser test on bundled payloads (implies --dry-run unless --write)")
     parser.add_argument("--write", action="store_true", help="write results even with --demo")
-    parser.add_argument("--local", action="store_true", help="use the local JSON store instead of Google Sheets")
     parser.add_argument("--no-cache", action="store_true", help="disable the HTTP disk cache")
     args = parser.parse_args(argv)
-
-    if args.local:
-        os.environ["NPFL_STORAGE"] = "local"
-        log(f"local store: {sheets.local_store_path()}")
 
     if args.demo and not args.write:
         args.dry_run = True
@@ -1060,19 +1052,19 @@ def main(argv: list[str] | None = None) -> int:
     rows = collect(args)
     log(f"requests used this run: {_request_count} (budget {REQUEST_BUDGET})")
 
-    for tab, records in rows.items():
-        log(f"{tab}: {len(records)} rows prepared")
+    for table, records in rows.items():
+        log(f"{table}: {len(records)} rows prepared")
 
     if args.dry_run:
-        for tab, records in rows.items():
+        for table, records in rows.items():
             for record in records[:3]:
-                log(f"  {tab} sample: {json.dumps(record, ensure_ascii=False)[:400]}")
+                log(f"  {table} sample: {json.dumps(record, ensure_ascii=False)[:400]}")
         log("dry-run: nothing written")
         return 0
 
-    summary = write_to_sheets(rows)
-    for tab, stats in summary.items():
-        log(f"{tab}: created={stats['created']} updated={stats['updated']} skipped={stats['skipped']}")
+    summary = write_to_db(rows)
+    for table, stats in summary.items():
+        log(f"{table}: created={stats['created']} updated={stats['updated']} skipped={stats['skipped']}")
     return 0
 
 
