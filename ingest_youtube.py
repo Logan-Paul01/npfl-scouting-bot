@@ -32,7 +32,7 @@ import requests
 import db
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 DEFAULT_PREROLL = int(os.environ.get("NPFL_CLIP_PREROLL", "6"))
 MAX_CHUNK_CHARS = int(os.environ.get("NPFL_CHUNK_CHARS", "2600"))
