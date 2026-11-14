@@ -57,7 +57,7 @@ Hardware assumption: any machine that can run Python 3.11+ and `pip install -r r
 |---|---|---|
 | Interface | **Telegram Bot** — `python-telegram-bot` | Free Bot API. Implemented in `bot.py` (Phase 2). |
 | Database / storage | **SQLite** — `scouting.db` via stdlib `sqlite3` | One file in the repo root. `db.py` is the only module allowed to touch the database. |
-| AI brain | **Groq** `llama-3.3-70b-versatile` | **Tool-calling mandatory.** The LLM must query Python functions that read the database. It never guesses or hallucinates statistics. |
+| AI brain | **Groq** `qwen/qwen3.8-27b` (default, override with `GROQ_MODEL`) | **Tool-calling mandatory.** The LLM must query Python functions that read the database. It never guesses or hallucinates statistics. |
 | Tactical visuals | `mplsoccer` + `matplotlib` | Dark mode: background `#121826`. Pitch maps, shot maps, passing networks. Phase 3. |
 | Video intelligence (Method A) | `youtube-transcript-api` → Groq → timestamp links | Store `https://youtu.be/{video_id}?t={seconds}`. No video files. |
 | Data ingestion | **Sofascore** (primary), **Flashscore / FootyStats** (fallback) | Fixtures, form, lineups, incidents, shot coordinates. |
@@ -110,7 +110,7 @@ Derived fields are honest about their window: `form` and `clean_sheets` are comp
 |---|---|---|
 | `NPFL_DB_PATH` | optional | SQLite file to use (default `scouting.db` in the repo root) |
 | `GROQ_API_KEY` | `.env` + Secret | LLM calls |
-| `GROQ_MODEL` | optional | Defaults to `llama-3.3-70b-versatile` |
+| `GROQ_MODEL` | optional | Defaults to `qwen/qwen3.8-27b` (must be a Groq model with tool use + JSON mode) |
 | `SOFASCORE_NPFL_TOURNAMENT_ID` | optional | Override auto-discovery of the NPFL tournament id |
 | `FOOTYSTATS_API_KEY` | optional Secret | Enables the FootyStats fallback |
 | `NPFL_CACHE_TTL` | optional | HTTP cache TTL in seconds (default 1800) |
@@ -207,7 +207,7 @@ Update this checklist at the end of **every** task. `[x]` means implemented **an
 
 ### Phase 2 — Telegram bot
 - [x] `bot.py` — `python-telegram-bot` entrypoint, allowlist enforced (default deny)
-- [x] Groq `llama-3.3-70b-versatile` with tools: `search_matches`, `get_match`, `get_team_stats`, `get_match_events`, `get_lineups`, `get_clips`
+- [x] Groq `qwen/qwen3.8-27b` with tools: `search_matches`, `get_match`, `get_team_stats`, `get_match_events`, `get_lineups`, `get_clips`
 - [x] `/preview <home> vs <away>` dossier: form, goal-timing, head-to-head, clip links + facts-only coach brief
 - [x] Hard refusal path when a stat is absent (deterministic commands render "no stored data" instead of a number)
 - [x] `/form`, `/match`, `/clips`, `/teams`, `/id`, `/refresh` plus free-text `/ask` with per-user cooldown
