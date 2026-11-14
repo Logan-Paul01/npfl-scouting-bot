@@ -58,11 +58,26 @@ except ImportError as exc:  # pragma: no cover
 LOG = logging.getLogger("npfl-bot")
 
 
+def _secret(*names: str) -> str:
+    """Read a secret under any common spelling.
+
+    Secret stores disagree on casing: TELEGRAM_BOT_TOKEN, Telegram_Bot_Token and
+    telegram-bot-token all mean the same thing, so compare names with punctuation
+    and case removed instead of making the owner rename their secret.
+    """
+    wanted = {"".join(ch for ch in name.lower() if ch.isalnum()) for name in names}
+    for key, value in os.environ.items():
+        normalised = "".join(ch for ch in key.lower() if ch.isalnum())
+        if normalised in wanted and (value or "").strip():
+            return value.strip()
+    return ""
+
+
 class _TokenRedaction(logging.Filter):
     """Never let the bot token reach a log line (httpx logs full request URLs)."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        token = os.environ.get("TELEGRAM_BOT_TOKEN") or TOKEN
+        token = TOKEN or _secret("TELEGRAM_BOT_TOKEN")
         if token:
             record.msg = str(record.msg).replace(token, "<telegram-token>")
             if isinstance(record.args, tuple):
@@ -73,11 +88,11 @@ class _TokenRedaction(logging.Filter):
 
 
 def has_groq() -> bool:
-    return bool((os.environ.get("GROQ_API_KEY") or "").strip())
+    return bool(_secret("GROQ_API_KEY"))
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
-TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+TOKEN = _secret("TELEGRAM_BOT_TOKEN")
 MAX_MESSAGE = 3900
 CACHE_TTL = int(os.environ.get("NPFL_BOT_CACHE_TTL", "60"))
 LLM_COOLDOWN = float(os.environ.get("NPFL_LLM_COOLDOWN", "8"))
@@ -85,7 +100,7 @@ MAX_TOOL_ROUNDS = 4
 
 
 def _allowed_ids() -> set[int]:
-    raw = os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "")
+    raw = _secret("TELEGRAM_ALLOWED_USER_IDS")
     return {int(part) for part in re.split(r"[,\s]+", raw) if part.strip().isdigit()}
 
 
