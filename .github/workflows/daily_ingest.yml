@@ -119,7 +119,7 @@ jobs:
       - name: Process the video queue
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GROQ_MODEL: ${{ vars.GROQ_MODEL || 'llama-3.3-70b-versatile' }}
+          GROQ_MODEL: ${{ vars.GROQ_MODEL || 'qwen/qwen3.8-27b' }}
         run: |
           python ingest_youtube.py --queue --max-chunks 12 2>&1 | tee video.log
           echo "### Video tail" >> "$GITHUB_STEP_SUMMARY"

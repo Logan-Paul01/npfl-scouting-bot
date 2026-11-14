@@ -3,7 +3,7 @@
 $0 / grounding rules enforced here:
   * Deterministic commands (`/preview`, `/form`, `/match`, `/clips`) read the database
     directly and never invent a number.
-  * Free text goes to Groq `llama-3.3-70b-versatile` with tool-calling; the model may
+  * Free text goes to Groq (`GROQ_MODEL`, default `qwen/qwen3.8-27b`) with tool-calling; the model may
     only state facts returned by those tools in the same turn.
   * No video, no images, no paid services. Per-user cooldown protects the free tier.
 
@@ -76,7 +76,7 @@ def has_groq() -> bool:
     return bool((os.environ.get("GROQ_API_KEY") or "").strip())
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
 TOKEN = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
 MAX_MESSAGE = 3900
 CACHE_TTL = int(os.environ.get("NPFL_BOT_CACHE_TTL", "60"))
