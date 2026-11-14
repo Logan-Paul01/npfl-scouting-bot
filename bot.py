@@ -1,7 +1,7 @@
-"""Telegram front-end: pre-match NPFL scouting over the Google Sheet.
+"""Telegram front-end: pre-match NPFL scouting over the SQLite database (`scouting.db`).
 
 $0 / grounding rules enforced here:
-  * Deterministic commands (`/preview`, `/form`, `/match`, `/clips`) read the Sheet
+  * Deterministic commands (`/preview`, `/form`, `/match`, `/clips`) read the database
     directly and never invent a number.
   * Free text goes to Groq `llama-3.3-70b-versatile` with tool-calling; the model may
     only state facts returned by those tools in the same turn.
@@ -9,10 +9,10 @@ $0 / grounding rules enforced here:
 
 Run:
     python bot.py                 # start polling
-    python bot.py --check         # validate token / Sheet / Groq config, then exit
+    python bot.py --check         # validate token / database / Groq config, then exit
 
 Env (see AGENTS.md §4): TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_IDS,
-GROQ_API_KEY, GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON|_FILE.
+GROQ_API_KEY, NPFL_DB_PATH (optional; defaults to ./scouting.db).
 """
 
 from __future__ import annotations
@@ -38,9 +38,7 @@ except ImportError:  # pragma: no cover - optional locally
 
 import requests
 
-import sheets
-
-sheets.bootstrap_env()
+import db
 
 try:
     from telegram import LinkPreviewOptions, Update
@@ -168,7 +166,7 @@ def split_message(text: str, limit: int = MAX_MESSAGE) -> list[str]:
 
 
 class SheetCache:
-    """Short-lived tab cache so one conversation does not re-read Sheets per message."""
+    """Short-lived table cache so one conversation does not re-read scouting.db per message."""
 
     def __init__(self, ttl: int = CACHE_TTL) -> None:
         self.ttl = ttl
@@ -178,7 +176,7 @@ class SheetCache:
         cached = self._data.get(tab)
         if cached and time.time() - cached[0] < self.ttl:
             return cached[1]
-        records = sheets.read_records(tab)
+        records = db.read_records(tab)
         self._data[tab] = (time.time(), records)
         return records
 
@@ -192,7 +190,7 @@ CACHE = SheetCache()
 # --- Domain lookups -------------------------------------------------------------
 
 def all_matches() -> list[dict[str, str]]:
-    return CACHE.get("NPFL_Matches")
+    return CACHE.get("matches")
 
 
 def match_by_id(match_id: str) -> dict[str, str] | None:
@@ -200,7 +198,7 @@ def match_by_id(match_id: str) -> dict[str, str] | None:
 
 
 def team_stats(team_id: str = "", team_name: str = "") -> dict[str, str] | None:
-    rows = CACHE.get("NPFL_Team_Stats")
+    rows = CACHE.get("team_stats")
     if team_id:
         for row in rows:
             if str(row.get("team_id")) == str(team_id):
@@ -213,12 +211,12 @@ def team_stats(team_id: str = "", team_name: str = "") -> dict[str, str] | None:
 
 
 def events_for(match_id: str) -> list[dict[str, str]]:
-    rows = [e for e in CACHE.get("NPFL_Events") if str(e.get("match_id")) == str(match_id)]
+    rows = [e for e in CACHE.get("events") if str(e.get("match_id")) == str(match_id)]
     return sorted(rows, key=lambda e: (to_int(e.get("minute"), 999), e.get("minute_label") or ""))
 
 
 def clips_for(match_id: str) -> list[dict[str, str]]:
-    return [c for c in CACHE.get("Video_Tactical_Clips") if str(c.get("match_id")) == str(match_id)]
+    return [c for c in CACHE.get("video_clips") if str(c.get("match_id")) == str(match_id)]
 
 
 def head_to_head(home_id: str, away_id: str, limit: int = 3) -> list[dict[str, str]]:
@@ -286,7 +284,7 @@ def goal_timing(team_name: str, limit: int = 5) -> tuple[list[int], int, int]:
         return bucket_counts, 0, 0
 
     by_id = {str(m.get("match_id")): m for m in sampled}
-    events = [e for e in CACHE.get("NPFL_Events") if str(e.get("match_id")) in by_id]
+    events = [e for e in CACHE.get("events") if str(e.get("match_id")) in by_id]
     total = 0
     for event in events:
         if str(event.get("event_type")).lower() != "goal":
@@ -588,7 +586,7 @@ def _pick(record: dict[str, str], fields: list[str]) -> dict[str, str]:
 
 
 def run_tool(name: str, arguments: dict) -> dict:
-    """Execute one grounding tool against the Sheet. Never raises."""
+    """Execute one grounding tool against the database. Never raises."""
     try:
         if name == "search_matches":
             team = str(arguments.get("team", ""))
@@ -611,7 +609,7 @@ def run_tool(name: str, arguments: dict) -> dict:
 
         if name == "get_lineups":
             match_id = str(arguments.get("match_id", ""))
-            rows = [r for r in CACHE.get("NPFL_Lineups") if str(r.get("match_id")) == match_id]
+            rows = [r for r in CACHE.get("lineups") if str(r.get("match_id")) == match_id]
             return {"lineups": [_pick(r, TOOL_FIELDS["lineup"]) for r in rows][:40]}
 
         if name == "get_clips":
@@ -639,11 +637,11 @@ Structure a scouting answer as: shape/build-up, pressing behaviour, set pieces, 
 
 
 def run_agent(question: str) -> str:
-    """Tool-calling loop over Groq; the model only sees Sheet-backed tool output."""
+    """Tool-calling loop over Groq; the model only sees database-backed tool output."""
     if not (os.environ.get("GROQ_API_KEY") or "").strip():
         return (
             "The AI brain is not configured yet (GROQ_API_KEY missing).\n"
-            "You can still use /preview, /form, /match and /clips — they read the Sheet directly."
+            "You can still use /preview, /form, /match and /clips — they read the database directly."
         )
 
     messages: list[dict[str, Any]] = [
@@ -769,7 +767,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/clips &lt;match_id&gt; — timestamped YouTube tactical clips\n"
         "/teams — teams in the database\n"
         "/id — your Telegram user id\n"
-        "/refresh — clear the local Sheet cache\n\n"
+        "/refresh — clear the local cache\n\n"
         "Or just ask a question, e.g. <i>how does Enyimba defend corners?</i>"
     )
     await reply(update, text)
@@ -789,12 +787,12 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @restricted
 async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     CACHE.invalidate()
-    await reply(update, "Cache cleared — the next answer re-reads Google Sheets.")
+    await reply(update, "Cache cleared — the next answer re-reads scouting.db.")
 
 
 @restricted
 async def cmd_teams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    rows = CACHE.get("NPFL_Team_Stats")
+    rows = CACHE.get("team_stats")
     names = sorted({r.get("team", "") for r in rows if r.get("team")})
     if not names:
         await reply(update, "No teams stored yet. Run <code>python scrape_npfl.py</code> first.")
@@ -978,13 +976,13 @@ def run_check() -> int:
 
     print(f"[check] allowlist: {len(ALLOWED_USER_IDS)} user id(s){' (TELEGRAM_ALLOW_ALL=1)' if ALLOW_ALL else ''}")
 
-    backend = sheets.storage_backend()
+    path = db.db_path()
     try:
-        matches = sheets.read_records("NPFL_Matches")
-        location = sheets.local_store_path() if backend == "local" else "Google Sheets"
-        print(f"[check] storage: {backend} ({location}) reachable: {len(matches)} row(s) in NPFL_Matches")
+        db.ensure_schema()
+        matches = db.read_records("matches")
+        print(f"[check] database: sqlite {path} reachable: {len(matches)} row(s) in matches")
     except Exception as exc:
-        problems.append(f"storage ({backend}): {exc}")
+        problems.append(f"database ({path}): {exc}")
 
     groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
     print(f"[check] GROQ_API_KEY: {'set' if groq_key else 'MISSING (chat answers disabled)'}")
@@ -1007,10 +1005,6 @@ def main(argv: list[str] | None = None) -> int:
         logging.getLogger(noisy).setLevel(logging.WARNING)
     for handler in logging.getLogger().handlers:
         handler.addFilter(_TokenRedaction())
-
-    if "--local" in argv:
-        os.environ["NPFL_STORAGE"] = "local"
-        LOG.info("using local JSON store: %s", sheets.local_store_path())
 
     if "--check" in argv:
         return run_check()
